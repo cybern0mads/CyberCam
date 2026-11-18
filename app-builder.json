@@ -1,0 +1,38 @@
+{
+  "package_name": "cybercam",
+  "version": "0.5.2",
+  "app_name": "CyberCam",
+  "bin_name": "cybercam",
+  "description": "CyberCam by Cybern0mads: creative camera, 8MP photos, GIF, MP4, Wi-Fi gallery and timelapse",
+  "store": {
+    "summary": "8MP camera, 16 retro/cyber filters, GIF, video, Gallery, timelapse & stop-motion",
+    "description": "CyberCam by Cybern0mads for Cardputer Zero: 8MP stills with unfiltered originals and 16 retro/cyber looks, photo and GIF capture, wide full-sensor silent MP4 video, on-device Gallery, timelapse with automatic MP4 export, manual stop-motion with onion-skin preview and GIF/MP4 export, boomerang and glitch GIFs. Includes a token-protected optional Wi-Fi Gallery. Redesigned Modes menu via 0, visible 9 Gallery button on camera and in mode picker, direct 4 Timelapse, 1 Photo, 2 GIF, 3 Video, 6 Capture/Start/Stop, 5 Look, 7 Size/Interval/Export, 9 Gallery.",
+    "categories": [
+      "Media",
+      "Creative & Office"
+    ],
+    "screenshots": [
+      "screenshots/camera_final_v052.png",
+      "screenshots/modes_final_v052.png",
+      "screenshots/gallery_demo.png"
+    ],
+    "icon": "assets/cybercam_appstore_512.png",
+    "license": "MIT",
+    "author": {
+      "display_name": "Cybern0mads",
+      "github": "cybern0mads"
+    },
+    "share_code": "CYCM",
+    "permissions": {
+      "camera": true,
+      "microphone": false,
+      "imu": false,
+      "network": true,
+      "additional_hardware": false,
+      "background_service": false,
+      "external_display": false
+    },
+    "locales": {},
+    "source_repo": "https://github.com/cybern0mads/CyberCam"
+  }
+}
