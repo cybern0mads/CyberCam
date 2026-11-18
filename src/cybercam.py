@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CyberCam 0.5.2 by Cybern0mads for M5Stack Cardputer Zero.
+"""CyberCam 0.5.3 by Cybern0mads for M5Stack Cardputer Zero.
 
 RGB565 framebuffer + evdev user interface; rpicam still/video/MJPEG backend.
 No modification to other camera applications is required.
@@ -45,7 +45,7 @@ except ImportError:
     ecodes = None
     list_devices = None
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 HOME = Path.home()
 ROOT = HOME / "Pictures" / "CyberCam"
 CONFIG = HOME / ".config" / "cybercam" / "settings.json"
@@ -545,11 +545,31 @@ class Recording:
 
 # --------------------- Creative capture modes (v0.5) -----------------------
 
-def encode_mp4(frames, destination, look="NORMAL", fps=15, size=MOVIE_SIZE):
-    """Convert ordered source images to a practical 4:3 timelapse/stop-motion MP4.
+def _sequential_jpeg_pattern(frames):
+    """Return a safe image2 sequence for consecutive numbered JPEGs, if possible."""
+    if not frames:
+        return None
+    import re
+    match = re.fullmatch(r"(.*?)([0-9]+)(\.jpe?g)", frames[0].name, re.I)
+    if not match:
+        return None
+    prefix, number, extension = match.groups()
+    width = len(number)
+    for offset, path in enumerate(frames):
+        expected = f"{prefix}{int(number) + offset:0{width}d}{extension}"
+        if path.parent != frames[0].parent or path.name != expected:
+            return None
+    return str(frames[0].parent / f"{prefix}%0{width}d{extension}"), int(number)
 
-    Frames remain on disk, unmodified; temporary resized frames are removed.
-    Uses software encoding, which may take time on the Cardputer Zero CPU.
+
+def encode_mp4(frames, destination, look="NORMAL", fps=15, size=MOVIE_SIZE, progress=None):
+    """Stream JPEGs to FFmpeg without creating a temporary PNG copy.
+
+    NORMAL uses FFmpeg's fast image2 JPEG decoder directly. Other looks are
+    processed one frame at a time and streamed to FFmpeg over rawvideo stdin,
+    preserving the chosen filter without materializing hundreds of PNGs.
+    The destination becomes visible only after FFmpeg finishes successfully.
+    Original JPEGs are never modified or deleted.
     """
     frames = [Path(f) for f in frames]
     if not frames:
@@ -559,33 +579,89 @@ def encode_mp4(frames, destination, look="NORMAL", fps=15, size=MOVIE_SIZE):
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fps = max(1, min(30, int(fps)))
-    with tempfile.TemporaryDirectory(prefix="cybercam_frames_") as td:
-        folder = Path(td)
-        for i, filename in enumerate(frames):
-            with Image.open(filename) as source:
-                # Expand to a letterboxed 4:3 frame; no camera FoV crop.
-                frame = preview_size(source, size)
-            if look != "NORMAL":
-                frame = filter_image(frame, look, preview=True)
-            frame.save(folder / f"frame_{i:06d}.png")
-        source_pattern = str(folder / "frame_%06d.png")
-        base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                "-framerate", str(fps), "-i", source_pattern,
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
-        # Try libx264, and fall back to MPEG-4 Part 2 for minimal FFmpeg builds.
-        failures = []
-        for encoder in (["-c:v", "libx264", "-preset", "ultrafast", "-crf", "26"],
-                        ["-c:v", "mpeg4", "-q:v", "5"]):
-            command = base + encoder + [str(destination)]
+    w, h = size
+    if w <= 0 or h <= 0 or w % 2 or h % 2:
+        raise ValueError("Video dimensions must be positive and even")
+    partial = destination.with_name(destination.stem + ".partial.mp4")
+    count = len(frames)
+    sequence = _sequential_jpeg_pattern(frames) if look == "NORMAL" else None
+
+    def announce(stage, n):
+        if progress:
+            progress(stage, n, count)
+
+    failures = []
+    # The fallback encoder is available in minimal FFmpeg builds.
+    encoders = (("libx264", ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "26"]),
+                ("mpeg4", ["-c:v", "mpeg4", "-q:v", "5"]))
+    try:
+        for name, encoder in encoders:
+            partial.unlink(missing_ok=True)
+            base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1"]
             try:
-                run_command(command, timeout=max(120, len(frames)*12))
-                if destination.stat().st_size < 1024:
-                    raise RuntimeError("Encoded MP4 was empty")
+                if sequence:
+                    pattern, first = sequence
+                    input_args = ["-framerate", str(fps), "-start_number", str(first),
+                                  "-i", pattern]
+                    vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                          f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0e141f,format=yuv420p")
+                    command = base + ["-stats_period", "1", "-progress", "pipe:1"] + input_args + [
+                        "-vf", vf, "-threads", "1", "-movflags", "+faststart"] + encoder + [str(partial)]
+                    announce("ENCODING", 0)
+                    with camera_log() as log:
+                        with subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                              stdout=subprocess.PIPE, stderr=log,
+                                              text=True, bufsize=1) as proc:
+                            for line in proc.stdout:
+                                if line.startswith("frame="):
+                                    try:
+                                        announce("ENCODING", min(count, int(line.split("=", 1)[1])))
+                                    except ValueError:
+                                        pass
+                            code = proc.wait()
+                else:
+                    # Arbitrary JPG filenames and creative looks stream through a
+                    # bounded raw-RGB pipe; only one source JPEG is opened at a time.
+                    input_args = ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s:v", f"{w}x{h}",
+                                  "-framerate", str(fps), "-i", "pipe:0"]
+                    command = base + input_args + ["-pix_fmt", "yuv420p", "-threads", "1",
+                                                   "-movflags", "+faststart"] + encoder + [str(partial)]
+                    announce("PROCESSING", 0)
+                    with camera_log() as log:
+                        with subprocess.Popen(command, stdin=subprocess.PIPE,
+                                              stdout=subprocess.DEVNULL, stderr=log) as proc:
+                            try:
+                                for i, filename in enumerate(frames, 1):
+                                    with Image.open(filename) as photo:
+                                        frame = preview_size(photo, size)
+                                    if look != "NORMAL":
+                                        frame = filter_image(frame, look, preview=True)
+                                    proc.stdin.write(frame.convert("RGB").tobytes())
+                                    announce("PROCESSING", i)
+                                proc.stdin.close()
+                                proc.stdin = None  # Popen context must not flush a closed pipe
+                                announce("ENCODING", count)
+                                code = proc.wait(timeout=max(120, count * 12))
+                            except Exception:
+                                proc.kill()
+                                proc.communicate()
+                                raise
+                if code:
+                    raise RuntimeError(f"FFmpeg {name} failed (exit {code}); see {LOG}")
+                if not partial.exists() or partial.stat().st_size < 1024:
+                    raise RuntimeError(f"FFmpeg {name} produced an empty video")
+                partial.replace(destination)
+                announce("DONE", count)
+                with camera_log() as log:
+                    log.write(f"CyberCam MP4 export SUCCESS: {count} frames, {destination}\n".encode())
                 return destination
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 failures.append(str(exc))
-                destination.unlink(missing_ok=True)
-        raise RuntimeError("MP4 export failed (frames preserved): " + "; ".join(failures))
+                partial.unlink(missing_ok=True)
+        raise RuntimeError("MP4 export failed (JPEG frames preserved): " + "; ".join(failures))
+    finally:
+        # A failure never leaves a misleading, incomplete .mp4 visible in Gallery.
+        partial.unlink(missing_ok=True)
 
 
 class TimelapseCapture:
@@ -605,7 +681,7 @@ class TimelapseCapture:
     def stop(self):
         self.stop_event.set()
 
-    def run(self, count=None, progress=None):
+    def run(self, count=None, progress=None, export_progress=None):
         if count is not None and not (1 <= count <= 20000):
             raise ValueError("Timelapse frame count must be 1..20000")
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -633,7 +709,7 @@ class TimelapseCapture:
             raise RuntimeError("Timelapse stopped without any frames")
         if progress:
             progress(len(self.frames), exporting=True)
-        encode_mp4(self.frames, self.output, self.look, self.fps)
+        encode_mp4(self.frames, self.output, self.look, self.fps, progress=export_progress)
         return self.output
 
 
@@ -1278,6 +1354,8 @@ def capture_action_label(mode, status):
     if mode == "VIDEO":
         return "6 STOP" if status == "REC" else "6 RECORD"
     if mode == "TIMELAPSE":
+        if status.startswith(("STOPPING", "PROCESSING", "ENCODING", "EXPORTING")):
+            return "6 WAIT"
         return "6 STOP" if status.startswith("LAPSE") else "6 START"
     if mode == "STOPMOTION":
         return "6 FRAME"
@@ -1412,6 +1490,7 @@ class CyberCamUI:
         self.stream = MjpegStream(rotation=self.settings["rotation"], fps=self.settings["preview_fps"])
         self.recording = None
         self.timelapse = None
+        self.timelapse_exporting = False
         self.stopmotion = None
         self.display = None
         self.devices = []
@@ -1485,15 +1564,27 @@ class CyberCamUI:
                     rotation=self.settings["rotation"],
                     look=self.settings["filter"])
         session = self.timelapse
+        def capture_progress(n, exporting=False):
+            if exporting:
+                self.timelapse_exporting = True
+                self.set_status("ENCODING LAPSE MP4...", float("inf"))
+            else:
+                self.set_status(f"LAPSE {n}F - 6 STOP", float("inf"))
+
+        def export_progress(stage, done, total):
+            if stage == "DONE":
+                return
+            self.timelapse_exporting = True
+            self.set_status(f"{stage} {done}/{total}", float("inf"))
+
         def operation():
             self.stream.stop()
             try:
-                path = session.run(progress=lambda n, exporting=False:
-                    self.set_status("EXPORTING LAPSE MP4..." if exporting
-                                    else f"LAPSE {n}F - 6 STOP", 40))
-                self.set_status("SAVED TIMELAPSE MP4", 6)
+                session.run(progress=capture_progress, export_progress=export_progress)
+                self.set_status("SAVED TIMELAPSE MP4", 8)
             finally:
                 self.timelapse = None
+                self.timelapse_exporting = False
                 self.stream.start()
         self.job(operation, "LAPSE STARTING...")
 
@@ -1532,7 +1623,9 @@ class CyberCamUI:
             try:
                 task()
             except Exception as exc:
-                self.set_status("ERR " + str(exc)[:36], 8)
+                with camera_log() as log:
+                    log.write(f"CyberCam worker error: {type(exc).__name__}: {exc}\n".encode())
+                self.set_status("ERR " + str(exc)[:36], 12)
                 # Still camera may be stopped after a failed operation.
                 if self.stream.proc is None and self.recording is None:
                     try:
@@ -1545,8 +1638,16 @@ class CyberCamUI:
         self.worker.start()
 
     def enter_gallery(self):
-        if self.recording is not None or self.busy:
-            self.set_status("STOP RECORDING FIRST", 3)
+        if self.recording is not None:
+            self.set_status("STOP VIDEO FIRST", 3)
+            return
+        if self.busy:
+            if self.timelapse_exporting:
+                self.set_status("EXPORTING MP4 - PLEASE WAIT", float("inf"))
+            elif self.timelapse is not None:
+                self.set_status("STOP TIMELAPSE FIRST", 4)
+            else:
+                self.set_status("BUSY - PLEASE WAIT", 4)
             return
         self.stream.stop()
         self.gallery = Gallery()
@@ -1586,8 +1687,9 @@ class CyberCamUI:
             return
         # Key 6 interrupts timelapse even while its worker is marked busy.
         if self.timelapse is not None and code in (ecodes.KEY_6, ecodes.KEY_ENTER, ecodes.KEY_SPACE):
-            self.timelapse.stop()
-            self.set_status("EXPORTING LAPSE...", 60)
+            if not self.timelapse_exporting:
+                self.timelapse.stop()
+                self.set_status("STOPPING LAPSE...", float("inf"))
             return
         if self.mode_menu:
             if code in (ecodes.KEY_ESC, ecodes.KEY_Q, ecodes.KEY_0, ecodes.KEY_M):
@@ -1714,7 +1816,7 @@ class CyberCamUI:
                         last_status = menu_state
                     time.sleep(0.03)
                     continue
-                if self.status != "REC" and now > self.status_deadline:
+                if self.status != "REC" and not self.busy and now > self.status_deadline:
                     self.status = "READY"
                 seq, jpg = self.stream.latest()
                 new_frame = seq != self.last_seq and jpg is not None
