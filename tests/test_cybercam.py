@@ -208,7 +208,7 @@ class TestCyberCam(unittest.TestCase):
         self.assertIn("ecodes.KEY_5", source)
 
     def test_version_and_branding(self):
-        self.assertEqual(cybercam.VERSION, '0.5.2')
+        self.assertEqual(cybercam.VERSION, '0.5.3')
         manifest = json.loads((Path(__file__).resolve().parents[1] / 'app-builder.json').read_text())
         self.assertEqual(manifest['store']['author']['display_name'], 'Cybern0mads')
         self.assertTrue(manifest['store']['permissions']['camera'])
