@@ -1,4 +1,4 @@
-# CyberCam v0.5.2 — by Cybern0mads
+# CyberCam v0.5.3 — by Cybern0mads
 
 **Open-source camera for M5Stack Cardputer Zero · 8MP photo · Retro filters · GIF · MP4 · Timelapse · Stop Motion · Wi-Fi Gallery**
 
@@ -10,7 +10,16 @@
 
 CyberCam is a standalone, keyboard-operated camera app for the Raspberry Pi-based **Cardputer Zero** with the IMX219 sensor and 320×170 display. It uses the standard Raspberry Pi `rpicam-*` camera utilities and an RGB565 framebuffer. No other camera application is required.
 
-## What's new in v0.5.2 — intuitive navigation
+## What's new in v0.5.3 — reliable timelapse export
+
+- **Direct JPEG-to-MP4 encoding:** normal timelapses no longer create hundreds of temporary PNG files.
+- **Filtered video:** retro looks stream frames individually to FFmpeg with bounded memory, preserving effects.
+- **Accurate status:** shows capture and encoding progress until MP4 export finishes, without returning to READY prematurely.
+- **Gallery unlock:** Gallery explains when an export is busy, then opens normally after encoding completes.
+- **Safe results:** incomplete videos use a temporary .partial.mp4 path; original JPEG frames survive failure and errors are logged.
+- **Hardware verification:** the v0.5.3 timelapse MP4 export and Gallery reopening have been tested successfully on Cardputer Zero.
+
+## Previously added in v0.5.2 — intuitive navigation
 
 - Press **`0`** (or `M`) once to open a full-screen, six-tile **Modes menu**. Navigate using arrows and Enter or use the numbered mode keys shown in the menu.
 - Press **`4`** directly from the viewfinder to enter **Timelapse**—no more cycling through hidden modes. Timelapse's `7 INTERVAL` and `6 START/STOP` are always labeled.
@@ -79,17 +88,17 @@ The active look, size or Timelapse interval are shown on the preview itself.
 
 ## Installation
 
-Download `cybercam_0.5.2_all.deb` from the [`releases/` folder](releases/). From **any computer with SSH installed** (macOS, Linux, or Windows PowerShell/OpenSSH), with the Cardputer on the same network:
+Build `cybercam_0.5.3_all.deb` using the [build instructions](#build-and-test), or use the binary when it is uploaded to `releases/`. From **any computer with SSH installed** (macOS, Linux, or Windows PowerShell/OpenSSH), with the Cardputer on the same network:
 
 ```bash
-scp ~/Downloads/cybercam_0.5.2_all.deb pi0@CardputerZero.local:/tmp/
+scp ~/Downloads/cybercam_0.5.3_all.deb pi0@CardputerZero.local:/tmp/
 ssh pi0@CardputerZero.local
 ```
 
 Then **on the Cardputer SSH terminal**:
 
 ```bash
-sudo apt install -y /tmp/cybercam_0.5.2_all.deb
+sudo apt install -y /tmp/cybercam_0.5.3_all.deb
 cybercam diagnose
 ```
 
@@ -166,5 +175,5 @@ MIT © 2026 **Cybern0mads** — <https://github.com/cybern0mads/CyberCam>
 - Retro looks are software simulations. `CYBERVISION` is **not actual infrared/thermal imaging**.
 - Camera access is exclusive: close another camera program before opening CyberCam. Live preview freezes during photo/timelapse/video operations that own the sensor.
 - Full-resolution 8MP image processing and timelapse encoding are CPU-intensive; long runs require power and sufficient SD-card capacity.
-- **Hardware verification is still needed** for Timelapse, Stop Motion, Boomerang, Wi-Fi over the device's network and the additional looks. Offline automated tests do not prove 15 FPS performance on the device.
-- For AppStore submission use `assets/cybercam_appstore_512.png`, a real Cardputer screenshot and the `cybercam_0.5.2_all.deb` package after on-device checks.
+- **Hardware verification:** v0.5.3 timelapse MP4 export and Gallery reopening were tested on Cardputer Zero. Other modes (Stop Motion, Boomerang, Wi-Fi Gallery and additional looks) require separate on-device verification. Offline tests do not prove 15 FPS performance on the device.
+- For AppStore submission use `assets/cybercam_appstore_512.png`, a real Cardputer screenshot and the tested `cybercam_0.5.3_all.deb` package. Publishing is a separate review process.
