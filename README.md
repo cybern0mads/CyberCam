@@ -8,7 +8,7 @@
 
 > Screenshots in this repository are simulated UI demonstrations. They are not real camera captures.
 
-CyberCam is a standalone, keyboard-operated camera app for the Raspberry Pi-based **Cardputer Zero** with the IMX219 sensor and 320×170 display. It uses the standard Raspberry Pi `rpicam-*` camera utilities and an RGB565 framebuffer. **AuraCam remains installed and unchanged.**
+CyberCam is a standalone, keyboard-operated camera app for the Raspberry Pi-based **Cardputer Zero** with the IMX219 sensor and 320×170 display. It uses the standard Raspberry Pi `rpicam-*` camera utilities and an RGB565 framebuffer. No other camera application is required.
 
 ## What's new in v0.5.2 — intuitive navigation
 
@@ -93,7 +93,7 @@ sudo apt install -y /tmp/cybercam_0.5.2_all.deb
 cybercam diagnose
 ```
 
-Close AuraCam or any other camera app first. Start **APPLaunch → CyberCam**. The package doesn't alter or uninstall AuraCam. Prior CyberCam captures stay in `~/Pictures/CyberCam/`.
+**Close any other camera app before opening CyberCam** so the camera is available. Start **APPLaunch → CyberCam**. Your existing CyberCam captures stay in `~/Pictures/CyberCam/`.
 
 ## CLI tests
 
@@ -162,7 +162,7 @@ The package is architecture-independent (`all`) and installs a Python CLI, a GUI
 
 MIT © 2026 **Cybern0mads** — <https://github.com/cybern0mads/CyberCam>
 
-- This is an independent community app, not an official Cardputer app. Game Boy, C64, MEMENTO, and other trademarks belong to their respective owners.
+- CyberCam is an independent community project, not an official Cardputer app. References to Game Boy, Commodore 64, and MEMENTO describe visual styles only. All trademarks belong to their respective owners.
 - Retro looks are software simulations. `CYBERVISION` is **not actual infrared/thermal imaging**.
 - Camera access is exclusive: close another camera program before opening CyberCam. Live preview freezes during photo/timelapse/video operations that own the sensor.
 - Full-resolution 8MP image processing and timelapse encoding are CPU-intensive; long runs require power and sufficient SD-card capacity.
