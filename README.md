@@ -79,7 +79,7 @@ The active look, size or Timelapse interval are shown on the preview itself.
 
 ## Installation
 
-Download `cybercam_0.5.2_all.deb` from this repo's Releases (or the `releases/` folder). **From the Mac terminal**, with Cardputer on the same Wi-Fi:
+Download `cybercam_0.5.2_all.deb` from the [`releases/` folder](releases/). From **any computer with SSH installed** (macOS, Linux, or Windows PowerShell/OpenSSH), with the Cardputer on the same network:
 
 ```bash
 scp ~/Downloads/cybercam_0.5.2_all.deb pi0@CardputerZero.local:/tmp/
