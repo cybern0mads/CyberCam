@@ -998,3 +998,932 @@ class VideoPlayback:
     def start(self):
         if not shutil.which("ffmpeg"):
             raise RuntimeError("Video playback needs ffmpeg (sudo apt install ffmpeg)")
+        cmd = self.command()
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        self.worker = threading.Thread(target=self._decode, daemon=True)
+        self.worker.start()
+
+    def _decode(self):
+        frame_bytes = self.size[0] * self.size[1] * 3
+        n = 0
+        started = time.monotonic()
+        proc = self.proc
+        try:
+            while not self.stop_event.is_set() and proc is not None and proc.stdout:
+                # Pause before read, so a paused view stays on one frame.
+                while self.paused and not self.stop_event.is_set():
+                    time.sleep(0.03)
+                    started = time.monotonic() - n / self.fps
+                if self.stop_event.is_set():
+                    break
+                data = bytearray()
+                while len(data) < frame_bytes and not self.stop_event.is_set():
+                    part = proc.stdout.read(frame_bytes - len(data))
+                    if not part:
+                        break
+                    data.extend(part)
+                if len(data) != frame_bytes:
+                    break
+                frame = Image.frombytes("RGB", self.size, bytes(data))
+                with self.lock:
+                    self.frame = frame
+                    self.seq += 1
+                n += 1
+                remaining = started + (n / self.fps) - time.monotonic()
+                if remaining > 0:
+                    self.stop_event.wait(remaining)
+            if not self.stop_event.is_set():
+                if n == 0:
+                    self.error = "No video frames decoded"
+                self.completed = True
+        except Exception as exc:
+            self.error = str(exc)
+            self.completed = True
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+
+    def latest(self):
+        with self.lock:
+            return self.seq, self.frame
+
+    def stop(self):
+        self.stop_event.set()
+        proc = self.proc
+        if proc is not None:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            if proc.stdout:
+                proc.stdout.close()
+        if self.worker is not None and self.worker is not threading.current_thread():
+            self.worker.join(timeout=2)
+        self.proc = None
+        self.worker = None
+
+
+class Gallery:
+    """Local playback state; safe for use from UI loop, no background camera work."""
+    def __init__(self, root=None):
+        self.items = gallery_files(root)
+        self.index = 0
+        self.reader = None
+        self.video = None
+        self.scene = None
+        self.playing = True
+        self.full = False
+        self.next_frame_at = 0.0
+        self.seq = 0
+        self.message = ""
+        self.kind = ""
+        self._video_seq = -1
+        self.select(0)
+
+    @property
+    def path(self):
+        if not self.items:
+            return None
+        return self.items[self.index]
+
+    def close_current(self):
+        if self.video is not None:
+            self.video.stop()
+            self.video = None
+        if self.reader is not None:
+            self.reader.close()
+            self.reader = None
+
+    def close(self):
+        self.close_current()
+
+    def select(self, offset):
+        self.close_current()
+        self.full = False
+        self.message = ""
+        self._video_seq = -1
+        self.playing = True
+        self.index = (self.index + offset) % len(self.items) if self.items else 0
+        self.scene = None
+        path = self.path
+        self.kind = path.suffix.lower().lstrip(".") if path else ""
+        self.seq += 1
+        if path is None:
+            self.message = "NO MEDIA - CAPTURE FIRST"
+            return
+        if self.kind == "mp4":
+            self.message = "PRESS 6 TO PLAY"
+            return
+        try:
+            self.reader = Image.open(path)
+            self.reader.seek(0)
+            self.scene = self.reader.convert("RGB")
+            self.next_frame_at = time.monotonic() + self._delay()
+        except (OSError, ValueError) as exc:
+            self.message = "IMAGE ERROR: " + str(exc)[:20]
+            self.close_current()
+
+    def _delay(self):
+        if self.reader is None:
+            return 0.13
+        return max(0.04, min(3, self.reader.info.get("duration", 130) / 1000.0))
+
+    def toggle(self):
+        if not self.items:
+            return
+        if self.kind == "mp4":
+            if self.video is None or self.video.completed:
+                if self.video is not None:
+                    self.video.stop()
+                self.video = VideoPlayback(self.path)
+                try:
+                    self.video.start()
+                except (OSError, RuntimeError) as exc:
+                    self.message = str(exc)[:35]
+                    self.video = None
+                    return
+                self.message = "PLAYING"
+                self.playing = True
+            else:
+                self.video.paused = not self.video.paused
+                self.playing = not self.video.paused
+                self.message = "PLAYING" if self.playing else "PAUSED"
+        elif self.kind == "gif":
+            self.playing = not self.playing
+            self.message = "PLAYING" if self.playing else "PAUSED"
+        else:
+            self.full = not self.full
+        self.seq += 1
+
+    def tick(self):
+        now = time.monotonic()
+        if self.kind == "gif" and self.playing and self.reader is not None and now >= self.next_frame_at:
+            try:
+                frame_index = (self.reader.tell() + 1) % self.reader.n_frames
+                self.reader.seek(frame_index)
+                self.scene = self.reader.convert("RGB")
+                self.next_frame_at = now + self._delay()
+                self.seq += 1
+            except (OSError, ValueError, EOFError):
+                self.message = "GIF READ ERROR"
+                self.playing = False
+        if self.kind == "mp4" and self.video is not None:
+            seq, frame = self.video.latest()
+            if frame is not None and seq != self._video_seq:
+                self.scene = frame
+                self._video_seq = seq
+                self.seq += 1
+            if self.video.completed:
+                self.message = "FINISHED - 6 REPLAY" if not self.video.error else "VIDEO ERROR"
+        return self.scene
+
+
+def draw_gallery(scene, gallery, width=320, height=170):
+    """Gallery lives on the LCD; all buttons stay visible on a 320x170 device."""
+    if gallery.full and gallery.kind not in ("gif", "mp4") and scene is not None:
+        image = preview_size(scene, (width, height))
+        d = ImageDraw.Draw(image)
+        d.rectangle((0, height - 16, width, height), fill=(13, 22, 35))
+        d.text((6, height - 13), "4 PREV  5 NEXT  6 BACK  9 CAMERA", font=font(9), fill=MINT)
+        return image
+    image = Image.new("RGB", (width, height), (10, 16, 25))
+    panel_w = 96 if width >= 290 else max(65, width // 3)
+    left_w = width - panel_w
+    if scene is not None:
+        image.paste(preview_size(scene, (left_w, height)), (0, 0))
+    d = ImageDraw.Draw(image)
+    d.rectangle((left_w, 0, width, height), fill=(13, 22, 35))
+    d.line((left_w, 0, left_w, height), fill=MINT, width=2)
+    d.text((left_w+7, 4), "GALLERY", font=font(11, True), fill=MINT)
+    if gallery.items:
+        d.text((left_w+7, 22), f"{gallery.index+1}/{len(gallery.items)} {gallery.kind.upper()}",
+               font=font(9), fill=PAPER)
+        name = gallery.path.name
+        d.text((left_w+7, 39), name[:14], font=font(8), fill=(175, 190, 198))
+        d.text((left_w+7, 50), name[14:28], font=font(8), fill=(175, 190, 198))
+    else:
+        d.text((6, height//2), "NO SAVED MEDIA", font=font(11, True), fill=PAPER)
+    for y, label in ((67, "4 < PREV"), (91, "5 > NEXT")):
+        d.rounded_rectangle((left_w+5,y,width-5,y+21), radius=4,
+                            fill=(27,36,49), outline=(55,70,80), width=1)
+        d.text((left_w+12,y+4), label, font=font(10), fill=PAPER)
+    if gallery.kind == "mp4":
+        action = "6 PAUSE" if gallery.video and not gallery.video.completed and gallery.playing else "6 PLAY"
+    elif gallery.kind == "gif":
+        action = "6 PAUSE" if gallery.playing else "6 PLAY"
+    else:
+        action = "6 FULL"
+    d.rounded_rectangle((left_w+5,118,width-5,140), radius=4, fill=MINT)
+    d.text((left_w+12,123), action, font=font(9, True), fill=(9,24,28))
+    d.text((left_w+7,149), "9 CAMERA", font=font(9, True), fill=(168,215,205))
+    if gallery.message:
+        d.rectangle((2,height-19,left_w-2,height-2), fill=(17,32,43))
+        d.text((6,height-16), gallery.message[:27], font=font(9), fill=MINT)
+    return image
+
+
+def get_keyboards():
+    if list_devices is None:
+        return []
+    found = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+            capabilities = dev.capabilities().get(ecodes.EV_KEY, [])
+            if ecodes.KEY_ESC in capabilities and ecodes.KEY_ENTER in capabilities:
+                found.append(dev)
+            else:
+                dev.close()
+        except (OSError, PermissionError):
+            continue
+    # Favor Cardputer's TCA8418 keyboard; avoid stealing unrelated USB devices.
+    found.sort(key=lambda d: ("tca8418" not in d.name.lower(), d.path))
+    return found[:1]
+
+
+def read_keys(devices):
+    if not devices:
+        return []
+    try:
+        readable, _, _ = select.select([d.fd for d in devices], [], [], 0)
+        keys = []
+        for dev in devices:
+            if dev.fd in readable:
+                for event in dev.read():
+                    if event.type == ecodes.EV_KEY and event.value == 1:
+                        keys.append(event.code)
+        return keys
+    except (OSError, BlockingIOError):
+        return []
+
+
+@lru_cache(maxsize=32)
+def font(size=12, bold=False):
+    base = "/usr/share/fonts/truetype/dejavu/DejaVuSans"
+    try:
+        return ImageFont.truetype(base + ("-Bold" if bold else "") + ".ttf", size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def capture_action_label(mode, status):
+    """Show the actual hardware capture key prominently on the button."""
+    if mode == "VIDEO":
+        return "6 STOP" if status == "REC" else "6 RECORD"
+    if mode == "TIMELAPSE":
+        return "6 STOP" if status.startswith("LAPSE") else "6 START"
+    if mode == "STOPMOTION":
+        return "6 FRAME"
+    if mode == "BOOMERANG":
+        return "6 LOOP"
+    return "6 CAPTURE"
+
+
+def draw_mode_menu(current="PHOTO", selected=0, width=320, height=170):
+    """Seven genuinely selectable tiles, with a prominent Gallery destination.
+
+    6 camera modes in a two-column grid; Gallery spans the full bottom row.
+    """
+    canvas = Image.new("RGB", (width, height), (9, 16, 28))
+    d = ImageDraw.Draw(canvas)
+    d.rectangle((0, 0, width, 23), fill=(17, 31, 46))
+    d.text((9, 4), "CYBERCAM  /  SELECT MODE", font=font(12, True), fill=MINT)
+    d.text((width-55, 7), "0 BACK", font=font(8), fill=(175, 195, 209))
+    choices = (
+        ("PHOTO", "1 PHOTO", "8MP + FILTERS"),
+        ("GIF", "2 GIF", "ANIMATED BURST"),
+        ("VIDEO", "3 VIDEO", "MP4 RECORDING"),
+        ("TIMELAPSE", "4 TIMELAPSE", "FRAMES TO MP4"),
+        ("STOPMOTION", "5 STOP MOTION", "ONION-SKIN FRAMES"),
+        ("BOOMERANG", "6 BOOMERANG", "FORWARD + REVERSE"),
+    )
+    gutter, gap = 8, 8
+    tile_w = (width - 2*gutter - gap)//2
+    for index, (name, title, subtitle) in enumerate(choices):
+        col, row = index%2, index//2
+        x = gutter + col*(tile_w+gap)
+        y = 26 + row*33
+        active = index == selected
+        bg = (31, 83, 83) if active else (24, 38, 55)
+        outline = MINT if active else (57, 77, 96)
+        d.rounded_rectangle((x, y, x+tile_w-1, y+29), radius=5,
+                            fill=bg, outline=outline, width=2 if active else 1)
+        d.text((x+9, y+2), title, font=font(10, active), fill=PAPER if active else (205, 225, 233))
+        d.text((x+9, y+18), subtitle, font=font(8), fill=(164, 220, 210) if active else (156, 177, 188))
+        if name == current:
+            d.ellipse((x+tile_w-15, y+5, x+tile_w-9, y+11), fill=MAGENTA)
+    active = selected == len(MODES)
+    d.rounded_rectangle((gutter, 127, width-gutter, 150), radius=6,
+                        fill=(79, 40, 104) if active else (36, 35, 70),
+                        outline=MINT if active else (191, 110, 224), width=2 if active else 1)
+    # Graphic album icon signals a different destination from the camera modes.
+    d.rounded_rectangle((18, 132, 32, 144), radius=2, outline=MINT, width=2)
+    d.ellipse((21, 134, 25, 138), fill=MINT)
+    d.line((20, 142, 24, 139, 27, 141, 30, 137), fill=MINT, width=1)
+    d.text((40, 131), "9 GALLERY", font=font(11, True), fill=PAPER)
+    d.text((139, 134), "VIEW PHOTOS / GIFS / VIDEO", font=font(9), fill=(199, 216, 238))
+    d.rectangle((0, height-17, width, height), fill=(13, 26, 38))
+    d.text((9, height-14), "ARROWS MOVE  |  ENTER SELECT  |  0 BACK", font=font(8), fill=(190, 218, 222))
+    return canvas
+
+
+def draw_ui(scene, mode="PHOTO", style="NORMAL", resolution="8MP", status="READY",
+            sound=True, recording_seconds=0, width=320, height=170, fps=0):
+    """Final camera UI: Photo/GIF/Video/Lapse + a full-width 9 GALLERY button.
+
+    Gallery is a prominent action rather than a tiny keyboard hint. The
+    viewfinder remains as wide as v0.5.1, preserving full-sensor framing.
+    """
+    image = Image.new("RGB", (width, height), (10, 16, 25))
+    panel_w = 99 if width >= 290 else max(74, width//3)
+    view_w = width - panel_w
+    if scene is not None:
+        image.paste(preview_size(scene, (view_w, height)), (0, 0))
+    d = ImageDraw.Draw(image)
+    d.rectangle((view_w, 0, width, height), fill=(13, 22, 35))
+    d.line((view_w, 0, view_w, height), fill=MINT, width=2)
+    d.text((view_w+7, 2), "CYBERCAM", font=font(10, True), fill=MINT)
+    d.text((view_w+7, 16), "0 ALL MODES", font=font(8, True), fill=(176, 211, 235))
+    for i, (value, label) in enumerate((
+        ("PHOTO", "1 PHOTO"), ("GIF", "2 GIF"),
+        ("VIDEO", "3 VIDEO"), ("TIMELAPSE", "4 TIMELAPSE"),
+    )):
+        y = 29 + i*18
+        active = mode == value
+        d.rounded_rectangle((view_w+5, y, width-5, y+16), radius=4,
+                            fill=(36, 98, 91) if active else (27, 36, 49),
+                            outline=MINT if active else (50, 70, 82), width=1)
+        d.text((view_w+12, y+2), label, font=font(9, active),
+               fill=PAPER if active else (183, 204, 216))
+    # High-contrast, one-press Gallery action. No nested menus needed.
+    d.rounded_rectangle((view_w+5, 104, width-5, 127), radius=5,
+                        fill=(52, 40, 85), outline=(185, 100, 225), width=2)
+    d.text((view_w+12, 108), "9 GALLERY", font=font(11, True), fill=PAPER)
+    recording_active = mode == "VIDEO" and status == "REC"
+    d.rounded_rectangle((view_w+5, 132, width-5, 154), radius=5,
+                        fill=MAGENTA if recording_active else MINT)
+    d.text((view_w+10, 136), capture_action_label(mode, status),
+           font=font(9, True), fill=(9, 24, 28))
+    d.text((view_w+7, 158), f"{fps:.0f}FPS {'SND' if sound else 'MUTE'}", font=font(8), fill=(177, 199, 204))
+    if mode == "TIMELAPSE":
+        detail, hint = f"LAPSE: EVERY {resolution}", "7 INTERVAL  |  6 START/STOP"
+    elif mode == "STOPMOTION":
+        detail, hint = f"STOP MOTION: {resolution}", "6 FRAME  |  7 EXPORT"
+    elif mode == "BOOMERANG":
+        detail, hint = "BOOMERANG", "5 LOOK  |  6 LOOP"
+    elif mode == "VIDEO":
+        detail, hint = f"VIDEO: {resolution}", "7 SIZE  |  6 RECORD/STOP"
+    elif mode == "PHOTO":
+        detail, hint = f"{style}  /  {resolution}", "5 LOOK  |  7 SIZE"
+    else:
+        detail, hint = style, "5 LOOK  |  6 CAPTURE"
+    d.rectangle((2, 1, min(view_w-2, 198), 17), fill=(14, 30, 43))
+    d.text((6, 3), detail[:29], font=font(9, True), fill=MINT)
+    if status == "REC":
+        d.rounded_rectangle((5, 22, min(view_w-5, 114), 44), radius=4, fill=(100, 21, 39))
+        d.ellipse((12, 29, 20, 37), fill=(255, 66, 89))
+        d.text((25, 27), f"REC {recording_seconds}s", font=font(11, True), fill=PAPER)
+    elif scene is None:
+        d.text((10, height//2), "STARTING CAMERA", font=font(10), fill=PAPER)
+    d.rectangle((2, height-17, view_w-2, height-2), fill=(17, 32, 43))
+    d.text((6, height-15), hint[:34], font=font(8), fill=(178, 214, 225))
+    if status not in ("READY", "REC"):
+        d.rectangle((2, height-34, view_w-2, height-18), fill=(17, 32, 43))
+        d.text((6, height-32), status[:31], font=font(9, True),
+               fill=MAGENTA if status.startswith("ERR") else MINT)
+    return image
+
+
+class CyberCamUI:
+    def __init__(self):
+        self.settings = load_settings()
+        self.mode = "PHOTO"
+        self.mode_menu = False
+        self.mode_selected = 0
+        self.gallery = None
+        self.status = "READY"
+        self.stream = MjpegStream(rotation=self.settings["rotation"], fps=self.settings["preview_fps"])
+        self.recording = None
+        self.timelapse = None
+        self.stopmotion = None
+        self.display = None
+        self.devices = []
+        self.busy = False
+        self.preview = None
+        self.last_seq = -1
+        self.running = True
+        self.status_deadline = 0
+        self.worker = None
+        self.fps = 0.0
+        self.frame_counter = 0
+        self.fps_time = time.monotonic()
+
+    def set_status(self, value, delay=3):
+        self.status = value
+        self.status_deadline = time.monotonic() + delay
+
+    def do_photo(self):
+        def operation():
+            self.stream.stop()
+            try:
+                original, effect = take_photo(self.settings["filter"],
+                                RESOLUTIONS[self.settings["resolution"]], self.settings["sound"], self.settings["rotation"])
+                self.set_status("SAVED " + (effect or original).name[:27], 4)
+            finally:
+                self.stream.start()
+        self.job(operation, "CAPTURING 8MP...")
+
+    def do_gif(self):
+        def operation():
+            path, count = gif_burst(self.stream, self.settings["filter"],
+                progress=lambda n, total: self.set_status(f"GIF {n}/{total}", 8),
+                sound=self.settings["sound"])
+            self.set_status(f"GIF SAVED {count} FRAMES", 4)
+        self.job(operation, "GIF 0/15")
+
+    def do_boomerang(self):
+        def operation():
+            path, count = boomerang_gif(self.stream, self.settings["filter"],
+                sound=self.settings["sound"],
+                progress=lambda n, total:self.set_status(f"LOOP {n}/{total}", 10))
+            self.set_status(f"BOOM SAVED {count}F", 5)
+        self.job(operation, "BOOMERANG...")
+
+    def do_stopmotion_frame(self):
+        if self.stopmotion is None:
+            self.stopmotion = StopMotionSession(self.settings["filter"])
+        seq, jpg = self.stream.latest()
+        try:
+            self.stopmotion.capture(jpg)
+            click(self.settings["sound"])
+            self.set_status(f"FRAME {len(self.stopmotion.frames)} - 7 EXPORT", 6)
+        except (OSError, RuntimeError) as exc:
+            self.set_status("ERR " + str(exc)[:26], 5)
+
+    def export_stopmotion(self):
+        if self.stopmotion is None or len(self.stopmotion.frames) < 2:
+            self.set_status("NEED AT LEAST 2 FRAMES", 4)
+            return
+        session = self.stopmotion
+        def operation():
+            path = session.export()
+            self.stopmotion = None
+            self.set_status("SAVED STOP MOTION MP4+GIF", 6)
+        self.job(operation, "EXPORTING MP4 + GIF...")
+
+    def do_timelapse(self):
+        interval = TIMELAPSE_INTERVALS[self.settings["timelapse_interval"]]
+        self.timelapse = TimelapseCapture(interval=interval,
+                    resolution=RESOLUTIONS[self.settings["resolution"]],
+                    rotation=self.settings["rotation"],
+                    look=self.settings["filter"])
+        session = self.timelapse
+        def operation():
+            self.stream.stop()
+            try:
+                path = session.run(progress=lambda n, exporting=False:
+                    self.set_status("EXPORTING LAPSE MP4..." if exporting
+                                    else f"LAPSE {n}F - 6 STOP", 40))
+                self.set_status("SAVED TIMELAPSE MP4", 6)
+            finally:
+                self.timelapse = None
+                self.stream.start()
+        self.job(operation, "LAPSE STARTING...")
+
+    def start_recording(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            self.stream.stop()
+            self.recording = Recording(VIDEOS[self.settings["video"]], rotation=self.settings["rotation"])
+            self.recording.start(sound=self.settings["sound"])
+            self.status = "REC"
+        except Exception as exc:
+            self.recording = None
+            self.set_status("ERR " + str(exc)[:37], 7)
+            self.stream.start()
+        finally:
+            self.busy = False
+
+    def stop_recording(self):
+        def operation():
+            try:
+                path = self.recording.stop(sound=self.settings["sound"])
+                self.set_status("VIDEO SAVED " + path.name[:20], 5)
+            finally:
+                self.recording = None
+                self.stream.start()
+        self.job(operation, "FINALIZING MP4...")
+
+    def job(self, task, headline):
+        if self.busy:
+            return
+        self.busy = True
+        self.set_status(headline, 30)
+        def wrapper():
+            try:
+                task()
+            except Exception as exc:
+                self.set_status("ERR " + str(exc)[:36], 8)
+                # Still camera may be stopped after a failed operation.
+                if self.stream.proc is None and self.recording is None:
+                    try:
+                        self.stream.start()
+                    except Exception:
+                        pass
+            finally:
+                self.busy = False
+        self.worker = threading.Thread(target=wrapper, daemon=True)
+        self.worker.start()
+
+    def enter_gallery(self):
+        if self.recording is not None or self.busy:
+            self.set_status("STOP RECORDING FIRST", 3)
+            return
+        self.stream.stop()
+        self.gallery = Gallery()
+        self.preview = None
+        self.last_seq = -1
+
+    def leave_gallery(self):
+        if self.gallery is None:
+            return
+        self.gallery.close()
+        self.gallery = None
+        self.preview = None
+        self.last_seq = -1
+        self.fps_time = time.monotonic()
+        self.frame_counter = 0
+        self.stream.start()
+
+    def select_mode(self, value):
+        """Switch mode without starting a capture. Preserve all media/settings."""
+        if value not in MODES:
+            raise ValueError(value)
+        self.mode = value
+        self.mode_selected = MODES.index(value)
+        self.mode_menu = False
+        self.set_status("READY", .1)
+
+    def key(self, code):
+        if self.gallery is not None:
+            if code in (ecodes.KEY_ESC, ecodes.KEY_Q, ecodes.KEY_9):
+                self.leave_gallery()
+            elif code in (ecodes.KEY_4, ecodes.KEY_LEFT):
+                self.gallery.select(-1)
+            elif code in (ecodes.KEY_5, ecodes.KEY_RIGHT):
+                self.gallery.select(1)
+            elif code in (ecodes.KEY_ENTER, ecodes.KEY_SPACE, ecodes.KEY_6):
+                self.gallery.toggle()
+            return
+        # Key 6 interrupts timelapse even while its worker is marked busy.
+        if self.timelapse is not None and code in (ecodes.KEY_6, ecodes.KEY_ENTER, ecodes.KEY_SPACE):
+            self.timelapse.stop()
+            self.set_status("EXPORTING LAPSE...", 60)
+            return
+        if self.mode_menu:
+            if code in (ecodes.KEY_ESC, ecodes.KEY_Q, ecodes.KEY_0, ecodes.KEY_M):
+                self.mode_menu = False
+            elif code in (ecodes.KEY_LEFT, ecodes.KEY_RIGHT, ecodes.KEY_UP, ecodes.KEY_DOWN, ecodes.KEY_TAB):
+                if code == ecodes.KEY_LEFT:
+                    self.mode_selected = (self.mode_selected - 1) % len(MENU_CHOICES)
+                elif code in (ecodes.KEY_RIGHT, ecodes.KEY_TAB):
+                    self.mode_selected = (self.mode_selected + 1) % len(MENU_CHOICES)
+                elif code == ecodes.KEY_UP:
+                    self.mode_selected = 4 if self.mode_selected == 6 else max(0, self.mode_selected - 2)
+                else:
+                    self.mode_selected = 6 if self.mode_selected >= 4 else self.mode_selected + 2
+            elif code in (ecodes.KEY_1, ecodes.KEY_2, ecodes.KEY_3,
+                          ecodes.KEY_4, ecodes.KEY_5, ecodes.KEY_6):
+                number = (ecodes.KEY_1, ecodes.KEY_2, ecodes.KEY_3,
+                          ecodes.KEY_4, ecodes.KEY_5, ecodes.KEY_6).index(code)
+                self.select_mode(MODES[number])
+            elif code in (ecodes.KEY_ENTER, ecodes.KEY_SPACE):
+                if self.mode_selected == len(MODES):
+                    self.mode_menu = False
+                    self.enter_gallery()
+                else:
+                    self.select_mode(MODES[self.mode_selected])
+            elif code == ecodes.KEY_9:
+                self.mode_menu = False
+                self.enter_gallery()
+            return
+        if code == ecodes.KEY_9:
+            self.enter_gallery()
+            return
+        if code in (ecodes.KEY_ESC, ecodes.KEY_Q):
+            if not self.busy:
+                self.running = False
+            return
+        if self.busy:
+            return
+        if code in (ecodes.KEY_ENTER, ecodes.KEY_SPACE, ecodes.KEY_6):
+            if self.mode == "PHOTO":
+                self.do_photo()
+            elif self.mode == "GIF":
+                self.do_gif()
+            elif self.mode == "VIDEO":
+                if self.recording:
+                    self.stop_recording()
+                else:
+                    self.start_recording()
+            elif self.mode == "TIMELAPSE":
+                self.do_timelapse()
+            elif self.mode == "STOPMOTION":
+                self.do_stopmotion_frame()
+            elif self.mode == "BOOMERANG":
+                self.do_boomerang()
+            return
+        # Never switch the camera mode during an active MP4 recording.
+        if self.recording:
+            return
+        if code in (ecodes.KEY_0, ecodes.KEY_M):
+            self.mode_menu = True
+            self.mode_selected = MODES.index(self.mode)
+        elif code in (ecodes.KEY_1, ecodes.KEY_2, ecodes.KEY_3, ecodes.KEY_4,
+                      ecodes.KEY_P, ecodes.KEY_G, ecodes.KEY_V):
+            value = {ecodes.KEY_1: "PHOTO", ecodes.KEY_2: "GIF",
+                     ecodes.KEY_3: "VIDEO", ecodes.KEY_4: "TIMELAPSE",
+                     ecodes.KEY_P: "PHOTO", ecodes.KEY_G: "GIF",
+                     ecodes.KEY_V: "VIDEO"}[code]
+            self.select_mode(value)
+        elif code in (ecodes.KEY_UP, ecodes.KEY_DOWN, ecodes.KEY_TAB):
+            direction = -1 if code == ecodes.KEY_UP else 1
+            self.select_mode(MODES[(MODES.index(self.mode) + direction) % len(MODES)])
+        elif code in (ecodes.KEY_5, ecodes.KEY_F, ecodes.KEY_RIGHT, ecodes.KEY_LEFT):
+            direction = -1 if code == ecodes.KEY_LEFT else 1
+            i = FILTERS.index(self.settings["filter"])
+            self.settings["filter"] = FILTERS[(i + direction) % len(FILTERS)]
+            save_settings(self.settings)
+        elif code in (ecodes.KEY_7, ecodes.KEY_R):
+            if self.mode == "STOPMOTION":
+                self.export_stopmotion()
+                return
+            if self.mode == "TIMELAPSE":
+                field, count = "timelapse_interval", len(TIMELAPSE_INTERVALS)
+            else:
+                field = "video" if self.mode == "VIDEO" else "resolution"
+                count = len(VIDEOS) if field == "video" else len(RESOLUTIONS)
+            self.settings[field] = (self.settings[field] + 1) % count
+            save_settings(self.settings)
+        elif code in (ecodes.KEY_8, ecodes.KEY_S):
+            self.settings["sound"] = not self.settings["sound"]
+            save_settings(self.settings)
+            click(self.settings["sound"])
+
+    def run(self, gallery_only=False):
+        try:
+            self.display = Framebuffer()
+            self.devices = get_keyboards()
+            if not self.devices:
+                raise RuntimeError("No evdev keyboard accessible; see README permissions")
+            if gallery_only:
+                self.gallery = Gallery()
+            else:
+                self.stream.start()
+            last_draw = 0.0
+            last_status = None
+            while self.running:
+                for code in read_keys(self.devices):
+                    self.key(code)
+                now = time.monotonic()
+                if self.gallery is not None:
+                    scene = self.gallery.tick()
+                    gallery_state = ("gallery", self.gallery.seq, self.gallery.message)
+                    if gallery_state != last_status or now - last_draw > 0.3:
+                        self.display.draw(draw_gallery(scene, self.gallery,
+                                                      width=self.display.w, height=self.display.h))
+                        last_draw = now
+                        last_status = gallery_state
+                    time.sleep(0.02)
+                    continue
+                if self.mode_menu:
+                    menu_state = ("modes", self.mode, self.mode_selected)
+                    if menu_state != last_status or now - last_draw > 2.0:
+                        self.display.draw(draw_mode_menu(self.mode, self.mode_selected,
+                                           width=self.display.w, height=self.display.h))
+                        last_draw = now
+                        last_status = menu_state
+                    time.sleep(0.03)
+                    continue
+                if self.status != "REC" and now > self.status_deadline:
+                    self.status = "READY"
+                seq, jpg = self.stream.latest()
+                new_frame = seq != self.last_seq and jpg is not None
+                if new_frame:
+                    try:
+                        with Image.open(io.BytesIO(jpg)) as im:
+                            self.preview = im.convert("RGB")
+                        self.last_seq = seq
+                        self.frame_counter += 1
+                    except OSError:
+                        new_frame = False
+                if now - self.fps_time >= 1.0:
+                    self.fps = self.frame_counter / max(.001, now - self.fps_time)
+                    self.frame_counter = 0
+                    self.fps_time = now
+                if self.status == "REC" and self.recording and self.recording.proc and self.recording.proc.poll() is not None:
+                    self.set_status("ERR recorder stopped; press ENTER", 6)
+                # Only redraw when the camera provides a frame or UI state changes.
+                # While recording, draw clock twice a second, not 8x unnecessarily.
+                state = (self.status, self.mode, self.settings["filter"],
+                         self.settings["resolution"], self.settings["video"],
+                         self.settings["timelapse_interval"], self.settings["sound"])
+                if not new_frame and state == last_status and now - last_draw < (0.5 if self.recording else 1.0):
+                    time.sleep(0.012)
+                    continue
+                last_draw = now
+                last_status = state
+                mode = self.mode
+                style = self.settings["filter"]
+                if self.preview is not None and self.status != "REC":
+                    # Filter only LCD-size frames. 15 FPS is a target, not guaranteed.
+                    scene = preview_size(self.preview, (self.display.w - 96, self.display.h))
+                    if mode == "STOPMOTION" and self.stopmotion is not None:
+                        scene = self.stopmotion.onion_skin(scene)
+                    if style != "NORMAL" and mode != "VIDEO":
+                        try:
+                            scene = filter_image(scene, style, preview=True)
+                        except Exception:
+                            pass
+                else:
+                    scene = self.preview
+                w, h = RESOLUTIONS[self.settings["resolution"]]
+                if mode == "VIDEO":
+                    w, h, fps, bitrate = VIDEOS[self.settings["video"]]
+                    label = VIDEO_LABELS[self.settings["video"]]
+                elif mode == "TIMELAPSE":
+                    label = str(TIMELAPSE_INTERVALS[self.settings["timelapse_interval"]]) + "s"
+                elif mode == "STOPMOTION":
+                    label = str(len(self.stopmotion.frames) if self.stopmotion else 0) + "F"
+                else:
+                    label = f"{w}x{h}" if mode == "PHOTO" else "15F/2S"
+                elapsed = int(now - self.recording.started) if self.recording and self.recording.started else 0
+                self.display.draw(draw_ui(scene, mode, style, label,
+                    self.status, self.settings["sound"], elapsed,
+                    width=self.display.w, height=self.display.h, fps=self.fps))
+                time.sleep(0.008)
+        finally:
+            if self.gallery is not None:
+                self.gallery.close()
+                self.gallery = None
+            if self.recording is not None:
+                try:
+                    self.recording.stop(sound=False)
+                except Exception:
+                    pass
+            self.stream.stop()
+            if self.worker and self.worker.is_alive():
+                self.worker.join(timeout=15)
+            for dev in self.devices:
+                dev.close()
+            if self.display:
+                self.display.close()
+
+
+def command_diagnose():
+    print("CyberCam", VERSION, "diagnostic")
+    print("Device:", sys.platform, os.uname().machine if hasattr(os, "uname") else "unknown")
+    for command in ("rpicam-still", "rpicam-vid", "aplay", "ffmpeg"):
+        print(f"{command}:", shutil.which(command) or "MISSING")
+    for name in ("/dev/fb0", "/dev/input", str(SHUTTER)):
+        print(name, "OK" if Path(name).exists() else "MISSING")
+    print("evdev:", "available" if InputDevice else "missing: sudo apt install python3-evdev")
+    print("numpy acceleration:", "available" if np is not None else "unavailable")
+    print("settings:", load_settings())
+    print("full-field camera mode (preview/video):", FULL_FOV_MODE)
+    print("video presets:", VIDEO_LABELS)
+    print("output:", ROOT)
+    print("log:", LOG)
+    return 0
+
+
+def command_demo():
+    """Offline demonstration without requiring a device or camera."""
+    d = Image.new("RGB", (640, 480), (16, 29, 44))
+    draw = ImageDraw.Draw(d)
+    for x in range(0, 640, 13):
+        draw.line((x, 0, (x + 210) % 640, 480), fill=(x % 120 + 40, 120, 145), width=1)
+    draw.ellipse((173, 53, 467, 346), fill=(50, 204, 156), outline=(240, 240, 240), width=4)
+    draw.rectangle((238, 158, 400, 257), fill=(18, 39, 55))
+    draw.text((263, 197), "CYBER", font=font(22, True), fill=PAPER)
+    path = Path.cwd() / "cybercam_ui_demo.png"
+    draw_ui(d).save(path)
+    gifpath = Path.cwd() / "cybercam_gboy_demo.gif"
+    frames = [ImageEnhance.Brightness(d).enhance(0.65+i/20) for i in range(15)]
+    save_gif(frames, "GREEN", gifpath)
+    print("Created", path, "and", gifpath)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="CyberCam for Cardputer Zero")
+    parser.add_argument("command", nargs="?", choices=["ui", "gallery", "photo", "gif", "video", "timelapse", "boomerang", "web", "demo", "diagnose", "config"], default="ui")
+    parser.add_argument("--filter", choices=FILTERS, default="NORMAL")
+    parser.add_argument("--resolution", choices=[f"{w}x{h}" for w, h in RESOLUTIONS], default="3280x2464")
+    parser.add_argument("--seconds", type=int, default=8, help="CLI video duration, 1-600 seconds")
+    parser.add_argument("--no-sound", action="store_true")
+    parser.add_argument("--rotation", type=int, choices=(0, 180), default=None,
+                        help="Photo, GIF and video orientation (0 or 180)")
+    parser.add_argument("--preview-fps", type=int, choices=(12, 15, 20, 24, 30), default=None,
+                        help="Set preview target FPS with the config command")
+    parser.add_argument("--video-quality", choices=("wide", "720p", "1080p", "480p"), default="wide")
+    parser.add_argument("--frames", type=int, default=12, help="Timelapse frame count, 1..20000")
+    parser.add_argument("--interval", type=float, default=5, help="Timelapse interval seconds, minimum 2")
+    parser.add_argument("--fps", type=int, default=15, help="Timelapse output FPS, 1..30")
+    parser.add_argument("--bind", default="127.0.0.1", help="Gallery listen address; 0.0.0.0 allows LAN access")
+    parser.add_argument("--port", type=int, default=8765, help="Gallery HTTP port")
+    args = parser.parse_args(argv)
+    try:
+        settings = load_settings()
+        if args.command == "config":
+            if args.rotation is not None:
+                settings["rotation"] = args.rotation
+            if args.preview_fps is not None:
+                settings["preview_fps"] = args.preview_fps
+            if args.rotation is not None or args.preview_fps is not None:
+                save_settings(settings)
+            print(json.dumps(settings, indent=2))
+            return 0
+        rotation = settings["rotation"] if args.rotation is None else args.rotation
+        if args.command == "demo":
+            return command_demo()
+        if args.command == "diagnose":
+            return command_diagnose()
+        if args.command == "gallery":
+            return CyberCamUI().run(gallery_only=True) or 0
+        if args.command == "web":
+            if not (1024 <= args.port <= 65535):
+                parser.error("--port must be 1024..65535")
+            serve_gallery(bind=args.bind, port=args.port)
+            return 0
+        if args.command == "photo":
+            dims = tuple(map(int, args.resolution.split("x")))
+            original, filtered = take_photo(args.filter, dims, not args.no_sound, rotation)
+            print("Original:", original)
+            if filtered:
+                print("Filtered:", filtered)
+            return 0
+        if args.command == "gif":
+            s = MjpegStream(rotation=rotation, fps=settings["preview_fps"])
+            try:
+                s.start()
+                seq, first = s.next_frame(s.seq, timeout=8)
+                if first is None:
+                    raise RuntimeError(f"No camera preview frames; see {LOG}")
+                path, count = gif_burst(s, args.filter, sound=not args.no_sound)
+                print(f"GIF ({count} frames):", path)
+            finally:
+                s.stop()
+            return 0
+        if args.command == "timelapse":
+            if not (2 <= args.interval <= 1800 and 1 <= args.frames <= 20000 and 1 <= args.fps <= 30):
+                parser.error("Timelapse --interval 2..1800; --frames 1..20000; --fps 1..30")
+            session = TimelapseCapture(interval=args.interval,
+                         resolution=tuple(map(int,args.resolution.split("x"))),
+                         rotation=rotation, look=args.filter, fps=args.fps)
+            path = session.run(count=args.frames, progress=lambda n,exporting=False:
+                    print("Encoding MP4..." if exporting else f"Captured {n}/{args.frames}",flush=True))
+            print("Timelapse MP4:",path,"Original frames:",session.folder)
+            return 0
+        if args.command == "boomerang":
+            stream = MjpegStream(rotation=rotation,fps=settings["preview_fps"])
+            try:
+                stream.start()
+                _, jpg = stream.next_frame(stream.seq,timeout=8)
+                if not jpg:
+                    raise RuntimeError("Camera preview unavailable")
+                path,count = boomerang_gif(stream,args.filter,sound=not args.no_sound)
+                print(f"Boomerang ({count} frames):",path)
+            finally:
+                stream.stop()
+            return 0
+        if args.command == "video":
+            if not (1 <= args.seconds <= 600):
+                parser.error("--seconds must be 1..600")
+            index = {"wide": 0, "1080p": 1, "720p": 2, "480p": 3}[args.video_quality]
+            record = Recording(VIDEOS[index], rotation=rotation)
+            path = record.start(seconds=args.seconds, sound=not args.no_sound)
+            print(f"Recording {args.seconds}s at {args.video_quality}; saving to {path}...")
+            try:
+                record.proc.wait(timeout=args.seconds + 20)
+            except (KeyboardInterrupt, subprocess.TimeoutExpired):
+                pass
+            print("Saved:", record.stop(sound=not args.no_sound))
+            return 0
+        return CyberCamUI().run() or 0
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f"CyberCam ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
