@@ -1,5 +1,14 @@
 # CyberCam Changelog
 
+## v0.5.3 — Reliable timelapse export (2026-11-18)
+- Encode normal timelapses directly from sequential JPEGs, skipping temporary PNG conversion.
+- Stream filtered timelapse and stop-motion frames to FFmpeg while preserving selected looks.
+- Publish a completed MP4 only after FFmpeg succeeds; original JPEG frames remain available after failure.
+- Show persistent capture/export progress with accurate Gallery busy state and no early READY.
+- Log export errors and successful outputs in the camera log; regression coverage for normal/filtered exports.
+- On-device verified: timelapse MP4 output and post-export Gallery access worked on Cardputer Zero.
+
+
 ## v0.5.2 — Final navigation layout (2026-11-18)
 - Dedicated, high-contrast **9 GALLERY** button visible on the main camera view.
 - Gallery is also a selectable full-width seventh tile in **0 ALL MODES**.
