@@ -22,7 +22,7 @@ shutil.copy2(project / 'src/cybercam.py', root / 'usr/lib/cybercam/cybercam.py')
 (root / 'usr/bin/cybercam').write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/lib/cybercam/cybercam.py "$@"\n')
 (root / 'usr/bin/cybercam').chmod(0o755)
 (root / 'DEBIAN/control').write_text('''Package: cybercam
-Version: 0.5.2
+Version: 0.5.3
 Section: graphics
 Priority: optional
 Architecture: all
@@ -68,6 +68,6 @@ for folder in root.rglob('*'):
         folder.chmod(0o755)
 (root / 'DEBIAN').chmod(0o755)
 (root / 'DEBIAN/control').chmod(0o644)
-output = project.parent / 'cybercam_0.5.2_all.deb'
+output = project.parent / 'cybercam_0.5.3_all.deb'
 subprocess.run(['dpkg-deb', '--build', '--root-owner-group', str(root), str(output)], check=True)
 print(output)
