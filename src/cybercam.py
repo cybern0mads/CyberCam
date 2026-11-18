@@ -2,7 +2,7 @@
 """CyberCam 0.5.2 by Cybern0mads for M5Stack Cardputer Zero.
 
 RGB565 framebuffer + evdev user interface; rpicam still/video/MJPEG backend.
-No modification to AuraCam or the stock CameraApp is required.
+No modification to other camera applications is required.
 """
 from __future__ import annotations
 
