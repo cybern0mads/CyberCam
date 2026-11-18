@@ -108,15 +108,15 @@ cybercam gallery
 
 **CLI Timelapse** has a finite `--frames` count; the UI Timelapse runs until `6 STOP`. The still-photo capture command has camera startup overhead, so a 2-second interval is a *minimum wait after each capture*, not a strict wall-clock 2-second start-to-start cadence.
 
-### Wi-Fi Gallery from a Mac (recommended secure method)
+### Wi-Fi Gallery from any computer (recommended secure method)
 
-On Cardputer SSH:
+On the Cardputer Zero (via SSH):
 
 ```bash
 cybercam web
 ```
 
-It will print a random, one-time token. In a **second Mac Terminal**, keep this SSH tunnel open:
+It will print a random, one-time token. On **any computer with SSH** (macOS Terminal, Linux terminal, or Windows PowerShell/OpenSSH), open a second terminal and keep this SSH tunnel running:
 
 ```bash
 ssh -L 8765:127.0.0.1:8765 pi0@CardputerZero.local
@@ -124,7 +124,7 @@ ssh -L 8765:127.0.0.1:8765 pi0@CardputerZero.local
 
 Visit the exact **`http://127.0.0.1:8765/?key=TOKEN`** shown by CyberCam, replacing `TOKEN` with the value printed by the server. After login, the browser uses an HttpOnly session cookie; the server is **local-only** by default. Press Ctrl+C in the server terminal to stop sharing.
 
-For phones on the **same trusted Wi-Fi**, explicitly run:
+For any computer, phone, or tablet on the **same trusted Wi-Fi**, you can instead explicitly run:
 
 ```bash
 cybercam web --bind 0.0.0.0 --port 8765
